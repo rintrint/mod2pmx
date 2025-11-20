@@ -80,33 +80,50 @@ class IniAnalyzer:
         self.ini_path = ini_path
         self.components = []
         self.all_textures = set()
-        # Store resolved paths for buffers based on INI parsing
+        # Store resolved paths and stride for buffers based on INI parsing
+        # Structure: {'Index': [{'file': 'path.ib', 'stride': 0}, ...], ...}
         self.buffers = {
-            "Index": None,  # ib
-            "Position": None,  # vb (pos)
-            "Blend": None,  # vb (blend/weight)
-            "TexCoord": None,  # vb (uv)
-            "Color": None,  # vb (vertex color)
-            "Vector": None,  # vb (normal/tangent)
+            "Index": [],  # List of {'file': name, 'stride': 0}
+            "Position": None,
+            "Blend": None,
+            "TexCoord": None,
+            "Color": None,
+            "Vector": None,
         }
 
     def parse(self):
         print(f"INI Parsing: {self.ini_path.name}")
         current_section = ""
+        current_res_type = None  # Track which resource we are in (e.g., Position)
 
         # Regex patterns
-        component_pattern = re.compile(r"\[TextureOverrideComponent(\d+)\]")
-        # Match resource sections like [ResourcePosition], [ResourceBlend], etc.
+        component_pattern = re.compile(r"\[TextureOverride(.*)\]")
         resource_section_pattern = re.compile(r"\[Resource(.*)\]")
 
         filename_pattern = re.compile(r"filename\s*=\s*(.*)")
-        draw_pattern = re.compile(r"drawindexed\s*=\s*(\d+),\s*(\d+),\s*(\d+)")
+        stride_pattern = re.compile(r"stride\s*=\s*(\d+)")
+        match_index_pattern = re.compile(r"match_first_index\s*=\s*(\d+)")
 
-        # Support direct vb/ib assignment if present (though less common in 3dmigoto for these games)
-        # e.g. ib = ... or vb1 = ...
-        direct_res_pattern = re.compile(r"^\s*(ib|vb\d+)\s*=\s*(.*)")
+        # Texture slots
+        texture_slot_pattern = re.compile(r"ps-t\d+\s*=\s*(.*)")
 
         comp_data = {}
+
+        # Helper to map resource names to internal keys
+        def get_res_key(name):
+            if "Position" in name:
+                return "Position"
+            if "Blend" in name:
+                return "Blend"
+            if "TexCoord" in name:
+                return "TexCoord"
+            if "Color" in name:
+                return "Color"
+            if "Vector" in name:
+                return "Vector"
+            if "IB" in name or "Index" in name:
+                return "Index"
+            return None
 
         try:
             with open(self.ini_path, encoding="utf-8", errors="ignore") as f:
@@ -117,79 +134,76 @@ class IniAnalyzer:
 
                     if line.startswith("["):
                         current_section = line
+                        current_res_type = None  # Reset resource tracking
 
                         # Check for Component
                         comp_match = component_pattern.match(line)
                         if comp_match:
-                            c_id = int(comp_match.group(1))
-                            comp_data[c_id] = {"id": c_id, "indices": None}
+                            c_name = comp_match.group(1).strip()
+                            if "VertexLimit" not in c_name and c_name != "IB":
+                                comp_data[c_name] = {"name": c_name, "first_index": 0, "count": 0}
 
-                        # Check for Resource (Position, Blend, etc.)
+                        # Check for Resource Section
                         res_match = resource_section_pattern.match(line)
                         if res_match:
-                            # current_section is already set, we will parse filename in the loop
-                            pass
+                            res_name = res_match.group(1)
+                            current_res_key = get_res_key(res_name)
+                            if current_res_key:
+                                # Initialize buffer info if not exist or create new entry
+                                if current_res_key == "Index":
+                                    # Index is a list, we append a new placeholder
+                                    self.buffers["Index"].append({"file": None, "stride": 0})
+                                    current_res_type = ("Index", -1)  # -1 means last element
+                                else:
+                                    self.buffers[current_res_key] = {"file": None, "stride": 0}
+                                    current_res_type = (current_res_key, None)
                         continue
 
-                    # Parse content based on section
-                    if "TextureOverrideComponent" in current_section:
-                        draw_match = draw_pattern.match(line)
-                        if draw_match:
-                            count, start = int(draw_match.group(1)), int(draw_match.group(2))
-                            c_id = int(component_pattern.match(current_section).group(1))
-                            comp_data[c_id]["indices"] = (start, count)
+                    # --- Parsing inside [Resource...] ---
+                    if current_res_type:
+                        key, idx = current_res_type
 
-                    # Check for filename (used in both Textures and Resources)
-                    file_match = filename_pattern.match(line)
-                    if file_match:
-                        fname = file_match.group(1).replace('"', "").strip()
+                        # Parse Filename
+                        file_match = filename_pattern.match(line)
+                        if file_match:
+                            fname = file_match.group(1).replace('"', "").strip()
+                            if idx == -1:
+                                self.buffers[key][-1]["file"] = fname
+                            else:
+                                self.buffers[key]["file"] = fname
 
-                        # If it's a texture (DDS)
-                        if fname.lower().endswith(".dds"):
-                            self.all_textures.add(fname)
+                        # Parse Stride
+                        stride_match = stride_pattern.match(line)
+                        if stride_match:
+                            stride_val = int(stride_match.group(1))
+                            if idx == -1:
+                                self.buffers[key][-1]["stride"] = stride_val
+                            else:
+                                self.buffers[key]["stride"] = stride_val
 
-                        # If it's a buffer in a Resource section
-                        elif "Resource" in current_section and ".buf" in fname.lower():
-                            res_type = resource_section_pattern.match(current_section).group(1)
-                            # Map common names to our internal keys
-                            if "Position" in res_type:
-                                self.buffers["Position"] = fname
-                            elif "Blend" in res_type:
-                                self.buffers["Blend"] = fname
-                            elif "TexCoord" in res_type:
-                                self.buffers["TexCoord"] = fname
-                            elif "Index" in res_type:
-                                self.buffers["Index"] = fname
-                            elif "Color" in res_type:
-                                self.buffers["Color"] = fname
-                            elif "Vector" in res_type:
-                                self.buffers["Vector"] = fname
+                    # --- Parsing inside [TextureOverride...] ---
+                    if "TextureOverride" in current_section:
+                        c_name = component_pattern.match(current_section).group(1).strip()
+                        if c_name in comp_data:
+                            idx_match = match_index_pattern.match(line)
+                            if idx_match:
+                                comp_data[c_name]["first_index"] = int(idx_match.group(1))
+                            # Capture textures inside override sections too
+                            texture_slot_pattern.match(line)
+                            # Note: This just catches direct filenames, handling references to Resources is harder
+                            # but the global search below catches actual files usually.
 
-                    # Check for direct ib/vb assignments (legacy or alternative format)
-                    direct_match = direct_res_pattern.match(line)
-                    if direct_match:
-                        key, val = direct_match.group(1), direct_match.group(2).split(";")[0].strip()
-                        if key.lower() == "ib":
-                            self.buffers["Index"] = val
-                        # Simple heuristic for vbs if not using named sections
-                        elif "vb" in key.lower():
-                            if "Position" in val:
-                                self.buffers["Position"] = val
-                            elif "Blend" in val:
-                                self.buffers["Blend"] = val
-                            elif "TexCoord" in val:
-                                self.buffers["TexCoord"] = val
+                    # Global texture search
+                    if "filename" in line.lower() and ".dds" in line.lower():
+                        file_match = filename_pattern.match(line)
+                        if file_match:
+                            self.all_textures.add(file_match.group(1).replace('"', "").strip())
 
         except Exception as e:
             print(f"[Error] Failed to read INI: {e}")
 
-        # Filter valid components and sort by start index
-        valid_comps = [c for c in comp_data.values() if c["indices"] is not None]
-        self.components = sorted(valid_comps, key=lambda x: x["indices"][0])
+        self.components = sorted(comp_data.values(), key=lambda x: x["first_index"])
         print(f"INI Parsed: Found {len(self.components)} components, {len(self.all_textures)} textures.")
-        # Debug buffer findings
-        found_bufs = [k for k, v in self.buffers.items() if v]
-        print(f"Buffers found in INI: {found_bufs}")
 
 
 # --- Math & Transform Utils ---
@@ -272,17 +286,21 @@ def convert_all_textures(mod_base_path, specific_output_dir, texture_set):
     return converted_list
 
 
-# --- File Finding Logic (XXMI Launcher Style) ---
-def find_buffer_file(base_path, ini_path, default_name):
+# --- File Finding Logic ---
+def find_buffer_file(base_path, ini_filename, default_names):
     """
+    Find file using INI name first, then defaults via recursion.
     Attempt to resolve the file path in the following order:
     1. Exact path from INI.
     2. Filename from INI in base_path (ignoring folders).
     3. Recursive search for default_name in base_path (if INI didn't specify).
     """
+    if isinstance(default_names, str):
+        default_names = [default_names]
+
     # 1. Try INI path
-    if ini_path:
-        clean_path = str(ini_path).replace("\\", "/").strip('"')
+    if ini_filename:
+        clean_path = str(ini_filename).replace("\\", "/").strip('"')
         # Full relative path check
         check_path = base_path / clean_path
         if check_path.exists():
@@ -293,73 +311,65 @@ def find_buffer_file(base_path, ini_path, default_name):
         # Simple check in base
         if (base_path / fname).exists():
             return base_path / fname
-
         # Recursive check for this specific filename
         for f in base_path.rglob(fname):
             return f
 
     # 2. Fallback: Recursive search for default name (e.g. "Position.buf")
-    # This mimics XXMI Launcher's scan_directory capability
-    for f in base_path.rglob(default_name):
-        if f.is_file():
-            return f
+    for name in default_names:
+        for f in base_path.rglob(name):
+            if f.is_file():
+                return f
 
     # 3. Last resort: Case-insensitive check
-    for f in base_path.rglob("*"):
-        if f.name.lower() == default_name.lower():
-            return f
+    for name in default_names:
+        for f in base_path.rglob("*"):
+            if f.name.lower() == name.lower():
+                return f
 
     return None
 
 
-# --- Data Reading Utils (Updated to accept Paths) ---
-def read_blend_data(blend_path, vertex_count):
-    blend_data = []
-    max_bone_index = 0
+# --- General Buffer Reader with Stride Support ---
+def read_buffer_with_stride(file_path, vertex_count, stride, data_format, element_size, default_value):
+    """
+    Read buffer with generic stride support.
 
-    if blend_path and blend_path.exists():
-        print(f"Reading Blend.buf: {blend_path.name}")
-        with open(blend_path, "rb") as f:
-            data = f.read()
-            # Stride 8: 4 bytes indices, 4 bytes weights (0-255)
-            if len(data) // 8 != vertex_count:
-                print(f"[Warning] Blend.buf size mismatch. Expected {vertex_count} vertices.")
+    stride: Total bytes per vertex in the file (e.g. 40).
+    data_format: struct format string for the ACTUAL data we want (e.g. '3f').
+    element_size: bytes size of the data we want (e.g. 12 for '3f').
+    default_value: fallback if file read fails.
+    """
+    result = []
+    if not file_path or not file_path.exists():
+        return [default_value] * vertex_count
 
-            raw_bytes = struct.unpack(f"<{len(data)}B", data)
+    with open(file_path, "rb") as f:
+        data = f.read()
 
-            for i in range(0, len(raw_bytes), 8):
-                b_indices = (raw_bytes[i], raw_bytes[i + 1], raw_bytes[i + 2], raw_bytes[i + 3])
-                b_weights = (raw_bytes[i + 4] / 255.0, raw_bytes[i + 5] / 255.0, raw_bytes[i + 6] / 255.0, raw_bytes[i + 7] / 255.0)
-                blend_data.append((b_indices, b_weights))
-                max_bone_index = max(max_bone_index, max(b_indices))
-    else:
-        print("[Warning] Blend.buf not found. Using default weights.")
-        blend_data = [((0, 0, 0, 0), (1.0, 0.0, 0.0, 0.0))] * vertex_count
+        # If stride is 0 or not provided, try to guess tightly packed
+        if stride == 0:
+            stride = element_size
 
-    return blend_data, max_bone_index
+        # Verify file size is sufficient
+        if len(data) < vertex_count * stride:
+            print(f"[Warning] {file_path.name} is too small for {vertex_count} vertices with stride {stride}.")
+            # Fallback: proceed and catch errors, or pad
+            pass
 
+        try:
+            for i in range(vertex_count):
+                offset = i * stride
+                if offset + element_size <= len(data):
+                    val = struct.unpack_from(f"<{data_format}", data, offset)
+                    result.append(val)
+                else:
+                    result.append(default_value)
+        except Exception as e:
+            print(f"[Error] Failed reading {file_path.name}: {e}")
+            return [default_value] * vertex_count
 
-def read_color_data(color_path, vertex_count):
-    colors = []
-    if color_path and color_path.exists():
-        print(f"Reading Color.buf: {color_path.name}")
-        with open(color_path, "rb") as f:
-            data = f.read()
-            # RGBA, 1 byte per channel
-            if len(data) // 4 == vertex_count:
-                raw_bytes = struct.unpack(f"<{len(data)}B", data)
-                for i in range(0, len(raw_bytes), 4):
-                    r = raw_bytes[i] / 255.0
-                    g = raw_bytes[i + 1] / 255.0
-                    b = raw_bytes[i + 2] / 255.0
-                    a = raw_bytes[i + 3] / 255.0
-                    colors.append((r, g, b, a))
-            else:
-                print("[Warning] Color.buf size mismatch. Filling with white.")
-                colors = [(1.0, 1.0, 1.0, 1.0)] * vertex_count
-    else:
-        colors = [(1.0, 1.0, 1.0, 1.0)] * vertex_count
-    return colors
+    return result
 
 
 def read_morph_data(mesh_dir):
@@ -372,8 +382,14 @@ def read_morph_data(mesh_dir):
     val_path = mesh_dir / "ShapeKeyVertexOffset.buf"
 
     if not (offset_path.exists() and id_path.exists() and val_path.exists()):
-        print("[Info] ShapeKey buffers not found (checked relative to Position.buf).")
-        return []
+        # Try finding recursively
+        offset_path = find_buffer_file(mesh_dir, None, "ShapeKeyOffset.buf")
+        if not offset_path:
+            return []
+        id_path = offset_path.parent / "ShapeKeyVertexId.buf"
+        val_path = offset_path.parent / "ShapeKeyVertexOffset.buf"
+        if not (id_path.exists() and val_path.exists()):
+            return []
 
     print("Reading ShapeKey buffers...")
     with open(offset_path, "rb") as f:
@@ -430,9 +446,6 @@ def process_single_mod(ini_path, output_dir):
     """Process a single .ini file and generates a .pmx file in the output directory."""
     mod_base_path = ini_path.parent
 
-    # Removed hardcoded 'Meshes' directory.
-    # We now use dynamic lookup similar to xxmi_launcher logic.
-
     # Determine output filename based on ini filename (e.g. mod.ini -> mod.pmx)
     pmx_filename = ini_path.stem + ".pmx"
     output_file = output_dir / pmx_filename
@@ -443,60 +456,137 @@ def process_single_mod(ini_path, output_dir):
     print(f"\n>>> Processing: {ini_path}")
     print(f"Target: {output_file}")
 
-    # 1. Parse INI & Textures (Robust parsing enabled)
+    # 1. Parse INI
     analyzer = IniAnalyzer(ini_path)
     analyzer.parse()
 
-    # Pass output_dir so textures go to pmx/SubFolder/tex
     pmx_texture_list = convert_all_textures(mod_base_path, output_dir, analyzer.all_textures)
 
     # 2. Read Geometry
-    # Use fallback logic if INI paths aren't present
-    pos_path = find_buffer_file(mod_base_path, analyzer.buffers["Position"], "Position.buf")
-    idx_path = find_buffer_file(mod_base_path, analyzer.buffers["Index"], "Index.buf")
 
+    # --- Position ---
+    pos_info = analyzer.buffers["Position"]  # {'file': '...', 'stride': 40}
+    pos_file = pos_info["file"] if pos_info else None
+    pos_stride = pos_info["stride"] if pos_info else 0
+
+    pos_path = find_buffer_file(mod_base_path, pos_file, "Position.buf")
     if not pos_path:
-        print(f"[Error] Position buffer (vb) not found in {mod_base_path} or subdirectories.")
-        return
-    if not idx_path:
-        print(f"[Error] Index buffer (ib) not found in {mod_base_path} or subdirectories.")
+        print(f"[Error] Position buffer not found in {mod_base_path}.")
         return
 
-    print(f"\nReading Geometry from:\n  Pos: {pos_path.name}\n  Idx: {idx_path.name}")
+    # Calculate Vertex Count
+    # Note: If stride is > 0, use it. If 0, assume packed float3 (12 bytes).
+    calc_stride = pos_stride if pos_stride > 0 else 12
+    count = os.path.getsize(pos_path) // calc_stride
 
-    with open(pos_path, "rb") as f:
-        count = os.path.getsize(pos_path) // 12
-        raw_verts = struct.unpack(f"<{count * 3}f", f.read())
+    print(f"  Detected Stride: {calc_stride}")
+    print(f"  Vertex Count: {count}")
 
-    with open(idx_path, "rb") as f:
-        indices = struct.unpack(f"<{os.path.getsize(idx_path) // 4}I", f.read())
+    # Read Positions using Stride
+    # Format '3f' = 12 bytes
+    raw_verts_tuples = read_buffer_with_stride(pos_path, count, calc_stride, "3f", 12, (0, 0, 0))
 
-    # Normals (Vector.buf)
+    # --- Indices ---
+    # Handle multiple IBs
+    indices = []
+    ib_candidates = analyzer.buffers["Index"]  # List of dicts
+
+    # If no IBs in INI, look for defaults
+    if not ib_candidates:
+        default_ib = find_buffer_file(mod_base_path, None, ["Index.buf", "*.ib"])
+        if default_ib:
+            # Fake a dict entry
+            ib_candidates = [{"file": default_ib.name, "stride": 0}]
+
+    loaded_ib_count = 0
+    if ib_candidates:
+        for ib_info in ib_candidates:
+            ib_name = ib_info["file"]
+            ib_path = find_buffer_file(mod_base_path, ib_name, ib_name)
+            if ib_path and ib_path.exists():
+                # print(f"Reading Index Buffer: {ib_path.name}")
+                with open(ib_path, "rb") as f:
+                    f_size = os.path.getsize(ib_path)
+                    if f_size % 4 == 0:
+                        new_indices = struct.unpack(f"<{f_size // 4}I", f.read())
+                        indices.extend(new_indices)
+                        loaded_ib_count += 1
+
+    if loaded_ib_count == 0:
+        print("[Error] No valid Index buffers found.")
+        return
+
+    # --- Normals ---
+    norm_info = analyzer.buffers["Vector"]
+    norm_file = norm_info["file"] if norm_info else None
+    norm_stride = norm_info["stride"] if norm_info else 0
+    norm_path = find_buffer_file(mod_base_path, norm_file, ["Vector.buf", "Normal.buf"])
+
     normals = [(0, 1, 0)] * count
-    vec_path = find_buffer_file(mod_base_path, analyzer.buffers["Vector"], "Vector.buf")
-    if vec_path:
-        with open(vec_path, "rb") as f:
-            raw_vecs = struct.unpack(f"<{os.path.getsize(vec_path)}b", f.read())
-            # Basic check if size matches expectations (stride 8 for normal+tangent is common)
-            if len(raw_vecs) == count * 8:
-                normals = [(raw_vecs[i + 4] / 127.0, raw_vecs[i + 5] / 127.0, raw_vecs[i + 6] / 127.0) for i in range(0, len(raw_vecs), 8)]
+    if norm_path:
+        # Read raw bytes to handle the specific indexing [i+4]
+        with open(norm_path, "rb") as f:
+            norm_data = f.read()
+            # Guess stride if missing
+            if norm_stride == 0:
+                norm_stride = len(norm_data) // count
 
-    # UVs (TexCoord.buf)
-    uvs = [(0, 0)] * count
-    uv_path = find_buffer_file(mod_base_path, analyzer.buffers["TexCoord"], "TexCoord.buf")
-    if uv_path:
-        with open(uv_path, "rb") as f:
-            raw_uvs = struct.unpack(f"<{os.path.getsize(uv_path) // 2}e", f.read())
-            uvs = [(raw_uvs[i], raw_uvs[i + 1]) for i in range(0, len(raw_uvs), 8)]
+            if norm_stride > 0:
+                for i in range(count):
+                    offset = i * norm_stride
+                    # Legacy logic: indices i*8+4, i*8+5, i*8+6.
+                    try:
+                        if offset + 7 < len(norm_data):
+                            nx = struct.unpack_from("b", norm_data, offset + 4)[0] / 127.0
+                            ny = struct.unpack_from("b", norm_data, offset + 5)[0] / 127.0
+                            nz = struct.unpack_from("b", norm_data, offset + 6)[0] / 127.0
+                            normals[i] = (nx, ny, nz)
+                    except Exception:
+                        pass
 
-    # Weights & Colors
-    blend_path = find_buffer_file(mod_base_path, analyzer.buffers["Blend"], "Blend.buf")
-    color_path = find_buffer_file(mod_base_path, analyzer.buffers["Color"], "Color.buf")
+    # --- UVs ---
+    uv_info = analyzer.buffers["TexCoord"]
+    uv_file = uv_info["file"] if uv_info else None
+    uv_stride = uv_info["stride"] if uv_info else 0
+    uv_path = find_buffer_file(mod_base_path, uv_file, "TexCoord.buf")
 
-    blend_data, max_bone_idx = read_blend_data(blend_path, count)
-    colors = read_color_data(color_path, count)
+    # UV Format: usually 2 half-floats (4 bytes)
+    uvs = read_buffer_with_stride(uv_path, count, uv_stride, "2e", 4, (0, 0))
 
-    # ShapeKeys
+    # --- Weights (Blend) ---
+    blend_info = analyzer.buffers["Blend"]
+    blend_file = blend_info["file"] if blend_info else None
+    blend_stride = blend_info["stride"] if blend_info else 0
+    blend_path = find_buffer_file(mod_base_path, blend_file, "Blend.buf")
+
+    blend_data = []
+    max_bone_idx = 0
+
+    if blend_path:
+        # Blend format: 4 bytes indices (4B), 4 bytes weights (4B) = 8 bytes total data we want.
+        # INI says stride=32. So we read 8 bytes at offset 0, skip 24.
+        raw_blends = read_buffer_with_stride(blend_path, count, blend_stride, "4B4B", 8, (0, 0, 0, 0, 0, 0, 0, 0))
+
+        for b_raw in raw_blends:
+            # b_raw is tuple of 8 ints
+            b_indices = b_raw[0:4]
+            b_weights = (b_raw[4] / 255.0, b_raw[5] / 255.0, b_raw[6] / 255.0, b_raw[7] / 255.0)
+            blend_data.append((b_indices, b_weights))
+            max_bone_idx = max(max_bone_idx, max(b_indices))
+    else:
+        blend_data = [((0, 0, 0, 0), (1, 0, 0, 0))] * count
+
+    # --- Colors ---
+    color_info = analyzer.buffers["Color"]
+    color_file = color_info["file"] if color_info else None
+    color_stride = color_info["stride"] if color_info else 0
+    color_path = find_buffer_file(mod_base_path, color_file, "Color.buf")
+
+    # Color format: 4 bytes (RGBA)
+    raw_colors = read_buffer_with_stride(color_path, count, color_stride, "4B", 4, (255, 255, 255, 255))
+    colors = [(c[0] / 255.0, c[1] / 255.0, c[2] / 255.0, c[3] / 255.0) for c in raw_colors]
+
+    # --- ShapeKeys ---
     # Assuming they reside in the same folder as Position.buf
     morph_list = read_morph_data(pos_path.parent)
 
@@ -531,7 +621,8 @@ def process_single_mod(ini_path, output_dir):
 
     for i in range(count):
         # 1. Position
-        px, py, pz = transform_pos(raw_verts[i * 3], raw_verts[i * 3 + 1], raw_verts[i * 3 + 2])
+        pos = raw_verts_tuples[i]
+        px, py, pz = transform_pos(pos[0], pos[1], pos[2])
         writer.write_vec3((px, py, pz))
 
         # 2. Normal
@@ -620,13 +711,39 @@ def process_single_mod(ini_path, output_dir):
 
     # [Materials]
     print(f"Writing {len(analyzer.components)} materials...")
-    writer.write_int(len(analyzer.components))
-    for comp in analyzer.components:
-        c_id = comp["id"]
-        idx_cnt = comp["indices"][1]
+    comps_to_write = analyzer.components
+    if not comps_to_write:
+        comps_to_write = [{"name": "Default", "first_index": 0, "count": len(indices)}]
 
-        writer.write_text(f"Component_{c_id}")  # JP Name
-        writer.write_text(f"Component_{c_id}")  # EN Name
+    print(f"Writing {len(comps_to_write)} materials...")
+    writer.write_int(len(comps_to_write))
+
+    total_indices_written = 0
+
+    for i, comp in enumerate(comps_to_write):
+        c_name = comp["name"]
+
+        # Logic to calculate material face count if not provided
+        if i == len(comps_to_write) - 1:
+            idx_cnt = len(indices) - total_indices_written
+        else:
+            # Try to find where the next component starts to calculate count
+            next_start = comps_to_write[i + 1]["first_index"]
+            current_start = comp["first_index"]
+            if next_start > current_start:
+                idx_cnt = next_start - current_start
+            else:
+                # Fallback if logic fails
+                idx_cnt = 0
+
+        # Safety check for 0 count on single material
+        if idx_cnt <= 0 and len(comps_to_write) == 1:
+            idx_cnt = len(indices)
+
+        total_indices_written += idx_cnt
+
+        writer.write_text(c_name)  # JP Name
+        writer.write_text(c_name)  # EN Name
 
         # Diffuse, Specular, Shininess, Ambient
         writer.write_vec4((1, 1, 1, 1))
@@ -668,11 +785,11 @@ def process_single_mod(ini_path, output_dir):
 
     # [Bones]
     # Dummy bones based on max index found in weights
+    dummy_bone_count = max_bone_idx + 1
     # +1 for 操作中心
-    original_bones_count = max_bone_idx + 1
-    total_bones = original_bones_count + 1
+    total_bones = dummy_bone_count + 1
 
-    print(f"Writing {total_bones} bones (1 操作中心 + {original_bones_count} dummy)...")
+    print(f"Writing {total_bones} bones (1 操作中心 + {dummy_bone_count} dummy)...")
     writer.write_int(total_bones)
 
     # 1. Write 操作中心 (Index 0)
@@ -686,7 +803,7 @@ def process_single_mod(ini_path, output_dir):
     writer.write_vec3((0, 0, 0))  # Tail pos
 
     # 2. Write Original Dummy Bones (Index 1 to N)
-    for b_idx in range(original_bones_count):
+    for b_idx in range(dummy_bone_count):
         # +1 for 操作中心
         b_name = f"Bone_{b_idx + 1}"
         writer.write_text(b_name)
@@ -740,7 +857,6 @@ def process_single_mod(ini_path, output_dir):
     writer.write_text("Other")
     writer.write_byte(0)  # Not a Special Frame
 
-    dummy_bone_count = original_bones_count
     writer.write_int(dummy_bone_count)
 
     for b_idx in range(1, total_bones):
@@ -773,7 +889,7 @@ def main():
 
     for ini_path in ini_files:
         # Skip if inside a 'Disabled' folder (optional common pattern) or system files
-        if "desktop.ini" in ini_path.name.lower():
+        if "desktop.ini" in ini_path.name.lower() or "disabled" in str(ini_path).lower():
             continue
 
         # Calculate relative path structure
