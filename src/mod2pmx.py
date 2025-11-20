@@ -80,13 +80,31 @@ class IniAnalyzer:
         self.ini_path = ini_path
         self.components = []
         self.all_textures = set()
+        # Store resolved paths for buffers based on INI parsing
+        self.buffers = {
+            "Index": None,  # ib
+            "Position": None,  # vb (pos)
+            "Blend": None,  # vb (blend/weight)
+            "TexCoord": None,  # vb (uv)
+            "Color": None,  # vb (vertex color)
+            "Vector": None,  # vb (normal/tangent)
+        }
 
     def parse(self):
         print(f"INI Parsing: {self.ini_path.name}")
         current_section = ""
+
+        # Regex patterns
         component_pattern = re.compile(r"\[TextureOverrideComponent(\d+)\]")
+        # Match resource sections like [ResourcePosition], [ResourceBlend], etc.
+        resource_section_pattern = re.compile(r"\[Resource(.*)\]")
+
         filename_pattern = re.compile(r"filename\s*=\s*(.*)")
         draw_pattern = re.compile(r"drawindexed\s*=\s*(\d+),\s*(\d+),\s*(\d+)")
+
+        # Support direct vb/ib assignment if present (though less common in 3dmigoto for these games)
+        # e.g. ib = ... or vb1 = ...
+        direct_res_pattern = re.compile(r"^\s*(ib|vb\d+)\s*=\s*(.*)")
 
         comp_data = {}
 
@@ -99,12 +117,21 @@ class IniAnalyzer:
 
                     if line.startswith("["):
                         current_section = line
+
+                        # Check for Component
                         comp_match = component_pattern.match(line)
                         if comp_match:
                             c_id = int(comp_match.group(1))
                             comp_data[c_id] = {"id": c_id, "indices": None}
+
+                        # Check for Resource (Position, Blend, etc.)
+                        res_match = resource_section_pattern.match(line)
+                        if res_match:
+                            # current_section is already set, we will parse filename in the loop
+                            pass
                         continue
 
+                    # Parse content based on section
                     if "TextureOverrideComponent" in current_section:
                         draw_match = draw_pattern.match(line)
                         if draw_match:
@@ -112,19 +139,57 @@ class IniAnalyzer:
                             c_id = int(component_pattern.match(current_section).group(1))
                             comp_data[c_id]["indices"] = (start, count)
 
-                    # Collect all textures
+                    # Check for filename (used in both Textures and Resources)
                     file_match = filename_pattern.match(line)
                     if file_match:
                         fname = file_match.group(1).replace('"', "").strip()
+
+                        # If it's a texture (DDS)
                         if fname.lower().endswith(".dds"):
                             self.all_textures.add(fname)
+
+                        # If it's a buffer in a Resource section
+                        elif "Resource" in current_section and ".buf" in fname.lower():
+                            res_type = resource_section_pattern.match(current_section).group(1)
+                            # Map common names to our internal keys
+                            if "Position" in res_type:
+                                self.buffers["Position"] = fname
+                            elif "Blend" in res_type:
+                                self.buffers["Blend"] = fname
+                            elif "TexCoord" in res_type:
+                                self.buffers["TexCoord"] = fname
+                            elif "Index" in res_type:
+                                self.buffers["Index"] = fname
+                            elif "Color" in res_type:
+                                self.buffers["Color"] = fname
+                            elif "Vector" in res_type:
+                                self.buffers["Vector"] = fname
+
+                    # Check for direct ib/vb assignments (legacy or alternative format)
+                    direct_match = direct_res_pattern.match(line)
+                    if direct_match:
+                        key, val = direct_match.group(1), direct_match.group(2).split(";")[0].strip()
+                        if key.lower() == "ib":
+                            self.buffers["Index"] = val
+                        # Simple heuristic for vbs if not using named sections
+                        elif "vb" in key.lower():
+                            if "Position" in val:
+                                self.buffers["Position"] = val
+                            elif "Blend" in val:
+                                self.buffers["Blend"] = val
+                            elif "TexCoord" in val:
+                                self.buffers["TexCoord"] = val
+
         except Exception as e:
             print(f"[Error] Failed to read INI: {e}")
 
         # Filter valid components and sort by start index
         valid_comps = [c for c in comp_data.values() if c["indices"] is not None]
         self.components = sorted(valid_comps, key=lambda x: x["indices"][0])
-        print(f"INI Parsed: Found {len(self.components)} components and {len(self.all_textures)} textures.")
+        print(f"INI Parsed: Found {len(self.components)} components, {len(self.all_textures)} textures.")
+        # Debug buffer findings
+        found_bufs = [k for k, v in self.buffers.items() if v]
+        print(f"Buffers found in INI: {found_bufs}")
 
 
 # --- Math & Transform Utils ---
@@ -207,14 +272,53 @@ def convert_all_textures(mod_base_path, specific_output_dir, texture_set):
     return converted_list
 
 
-# --- Data Reading Utils ---
-def read_blend_data(mesh_dir, vertex_count):
-    blend_path = mesh_dir / "Blend.buf"
+# --- File Finding Logic (XXMI Launcher Style) ---
+def find_buffer_file(base_path, ini_path, default_name):
+    """
+    Attempt to resolve the file path in the following order:
+    1. Exact path from INI.
+    2. Filename from INI in base_path (ignoring folders).
+    3. Recursive search for default_name in base_path (if INI didn't specify).
+    """
+    # 1. Try INI path
+    if ini_path:
+        clean_path = str(ini_path).replace("\\", "/").strip('"')
+        # Full relative path check
+        check_path = base_path / clean_path
+        if check_path.exists():
+            return check_path
+
+        # Check just filename in root/subdirs
+        fname = Path(clean_path).name
+        # Simple check in base
+        if (base_path / fname).exists():
+            return base_path / fname
+
+        # Recursive check for this specific filename
+        for f in base_path.rglob(fname):
+            return f
+
+    # 2. Fallback: Recursive search for default name (e.g. "Position.buf")
+    # This mimics XXMI Launcher's scan_directory capability
+    for f in base_path.rglob(default_name):
+        if f.is_file():
+            return f
+
+    # 3. Last resort: Case-insensitive check
+    for f in base_path.rglob("*"):
+        if f.name.lower() == default_name.lower():
+            return f
+
+    return None
+
+
+# --- Data Reading Utils (Updated to accept Paths) ---
+def read_blend_data(blend_path, vertex_count):
     blend_data = []
     max_bone_index = 0
 
-    if blend_path.exists():
-        print("Reading Blend.buf (Weights)...")
+    if blend_path and blend_path.exists():
+        print(f"Reading Blend.buf: {blend_path.name}")
         with open(blend_path, "rb") as f:
             data = f.read()
             # Stride 8: 4 bytes indices, 4 bytes weights (0-255)
@@ -235,11 +339,10 @@ def read_blend_data(mesh_dir, vertex_count):
     return blend_data, max_bone_index
 
 
-def read_color_data(mesh_dir, vertex_count):
-    color_path = mesh_dir / "Color.buf"
+def read_color_data(color_path, vertex_count):
     colors = []
-    if color_path.exists():
-        print("Reading Color.buf (Vertex Colors)...")
+    if color_path and color_path.exists():
+        print(f"Reading Color.buf: {color_path.name}")
         with open(color_path, "rb") as f:
             data = f.read()
             # RGBA, 1 byte per channel
@@ -260,12 +363,16 @@ def read_color_data(mesh_dir, vertex_count):
 
 
 def read_morph_data(mesh_dir):
+    # ShapeKeys are usually in the same folder as Position.buf
+    if not mesh_dir or not mesh_dir.exists():
+        return []
+
     offset_path = mesh_dir / "ShapeKeyOffset.buf"
     id_path = mesh_dir / "ShapeKeyVertexId.buf"
     val_path = mesh_dir / "ShapeKeyVertexOffset.buf"
 
     if not (offset_path.exists() and id_path.exists() and val_path.exists()):
-        print("[Info] ShapeKey buffers not found. Skipping morphs.")
+        print("[Info] ShapeKey buffers not found (checked relative to Position.buf).")
         return []
 
     print("Reading ShapeKey buffers...")
@@ -322,7 +429,9 @@ def read_morph_data(mesh_dir):
 def process_single_mod(ini_path, output_dir):
     """Process a single .ini file and generates a .pmx file in the output directory."""
     mod_base_path = ini_path.parent
-    mesh_dir = mod_base_path / "Meshes"
+
+    # Removed hardcoded 'Meshes' directory.
+    # We now use dynamic lookup similar to xxmi_launcher logic.
 
     # Determine output filename based on ini filename (e.g. mod.ini -> mod.pmx)
     pmx_filename = ini_path.stem + ".pmx"
@@ -334,11 +443,7 @@ def process_single_mod(ini_path, output_dir):
     print(f"\n>>> Processing: {ini_path}")
     print(f"Target: {output_file}")
 
-    if not mesh_dir.exists():
-        print(f"[Skip] 'Meshes' folder not found in {mod_base_path}")
-        return
-
-    # 1. Parse INI & Textures
+    # 1. Parse INI & Textures (Robust parsing enabled)
     analyzer = IniAnalyzer(ini_path)
     analyzer.parse()
 
@@ -346,37 +451,54 @@ def process_single_mod(ini_path, output_dir):
     pmx_texture_list = convert_all_textures(mod_base_path, output_dir, analyzer.all_textures)
 
     # 2. Read Geometry
-    print("\nReading Geometry buffers...")
-    pos_path = mesh_dir / "Position.buf"
-    if not pos_path.exists():
-        print(f"[Error] Position.buf missing in {mesh_dir}")
+    # Use fallback logic if INI paths aren't present
+    pos_path = find_buffer_file(mod_base_path, analyzer.buffers["Position"], "Position.buf")
+    idx_path = find_buffer_file(mod_base_path, analyzer.buffers["Index"], "Index.buf")
+
+    if not pos_path:
+        print(f"[Error] Position buffer (vb) not found in {mod_base_path} or subdirectories.")
         return
+    if not idx_path:
+        print(f"[Error] Index buffer (ib) not found in {mod_base_path} or subdirectories.")
+        return
+
+    print(f"\nReading Geometry from:\n  Pos: {pos_path.name}\n  Idx: {idx_path.name}")
 
     with open(pos_path, "rb") as f:
         count = os.path.getsize(pos_path) // 12
         raw_verts = struct.unpack(f"<{count * 3}f", f.read())
 
-    idx_path = mesh_dir / "Index.buf"
     with open(idx_path, "rb") as f:
         indices = struct.unpack(f"<{os.path.getsize(idx_path) // 4}I", f.read())
 
+    # Normals (Vector.buf)
     normals = [(0, 1, 0)] * count
-    vec_path = mesh_dir / "Vector.buf"
-    if vec_path.exists():
+    vec_path = find_buffer_file(mod_base_path, analyzer.buffers["Vector"], "Vector.buf")
+    if vec_path:
         with open(vec_path, "rb") as f:
             raw_vecs = struct.unpack(f"<{os.path.getsize(vec_path)}b", f.read())
-            normals = [(raw_vecs[i + 4] / 127.0, raw_vecs[i + 5] / 127.0, raw_vecs[i + 6] / 127.0) for i in range(0, len(raw_vecs), 8)]
+            # Basic check if size matches expectations (stride 8 for normal+tangent is common)
+            if len(raw_vecs) == count * 8:
+                normals = [(raw_vecs[i + 4] / 127.0, raw_vecs[i + 5] / 127.0, raw_vecs[i + 6] / 127.0) for i in range(0, len(raw_vecs), 8)]
 
+    # UVs (TexCoord.buf)
     uvs = [(0, 0)] * count
-    uv_path = mesh_dir / "TexCoord.buf"
-    if uv_path.exists():
+    uv_path = find_buffer_file(mod_base_path, analyzer.buffers["TexCoord"], "TexCoord.buf")
+    if uv_path:
         with open(uv_path, "rb") as f:
             raw_uvs = struct.unpack(f"<{os.path.getsize(uv_path) // 2}e", f.read())
             uvs = [(raw_uvs[i], raw_uvs[i + 1]) for i in range(0, len(raw_uvs), 8)]
 
-    blend_data, max_bone_idx = read_blend_data(mesh_dir, count)
-    colors = read_color_data(mesh_dir, count)
-    morph_list = read_morph_data(mesh_dir)
+    # Weights & Colors
+    blend_path = find_buffer_file(mod_base_path, analyzer.buffers["Blend"], "Blend.buf")
+    color_path = find_buffer_file(mod_base_path, analyzer.buffers["Color"], "Color.buf")
+
+    blend_data, max_bone_idx = read_blend_data(blend_path, count)
+    colors = read_color_data(color_path, count)
+
+    # ShapeKeys
+    # Assuming they reside in the same folder as Position.buf
+    morph_list = read_morph_data(pos_path.parent)
 
     # 3. Write PMX
     print(f"\nWriting PMX file: {output_file}")
