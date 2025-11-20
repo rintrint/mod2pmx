@@ -66,7 +66,7 @@ class BinaryWriter:
         self.write_short(idx)  # 2 bytes
 
     def write_morph_index(self, idx):
-        self.write_short(idx)  # 2 bytes (Updated to match Header)
+        self.write_short(idx)  # 2 bytes
 
     def write_material_index(self, idx):
         self.write_signed_byte(idx)  # 1 byte
@@ -357,8 +357,7 @@ def main():
     writer.write_byte(1)  # Texture Index Size
     writer.write_byte(1)  # Material Index Size
     writer.write_byte(2)  # Bone Index Size
-
-    # [UPDATE] Set Morph Index Size to 2 (Short) to handle > 255 morphs
+    # Set Morph Index Size to 2 (Short) to handle > 255 morphs
     writer.write_byte(2)  # Morph Index Size
     writer.write_byte(1)  # Rigid Index Size
 
@@ -391,15 +390,20 @@ def main():
         # 5. Weight Optimization (BDEF1 / BDEF2 / BDEF4)
         raw_indices, raw_weights = blend_data[i]
 
-        # Filter valid bones (weight > 0)
-        valid_bones = [(raw_indices[j], raw_weights[j]) for j in range(4) if raw_weights[j] > 0.0001]
+        # Filter valid bones (weight > 0) and SHIFT INDICES
+        valid_bones = []
+        for j in range(4):
+            if raw_weights[j] > 0.0001:
+                # +1 for 操作中心
+                shifted_idx = raw_indices[j] + 1
+                valid_bones.append((shifted_idx, raw_weights[j]))
 
         # Sort by weight descending
         valid_bones.sort(key=lambda x: x[1], reverse=True)
         b_count = len(valid_bones)
 
         if b_count == 0:
-            # Fallback BDEF1
+            # Fallback BDEF1 -> Attach to 操作中心 (Index 0)
             writer.write_byte(0)  # Type 0
             writer.write_bone_index(0)
 
@@ -506,16 +510,31 @@ def main():
 
     # [Bones]
     # Dummy bones based on max index found in weights
-    total_bones = max_bone_idx + 1
-    print(f"Writing {total_bones} bones (Dummy structure)...")
+    # +1 for 操作中心
+    original_bones_count = max_bone_idx + 1
+    total_bones = original_bones_count + 1
+
+    print(f"Writing {total_bones} bones (1 操作中心 + {original_bones_count} dummy)...")
     writer.write_int(total_bones)
 
-    for b_idx in range(total_bones):
-        b_name = f"Bone_{b_idx}"
+    # 1. Write 操作中心 (Index 0)
+    writer.write_text("操作中心")
+    writer.write_text("view cnt")
+    writer.write_vec3((0, 0, 0))  # Pos
+    writer.write_bone_index(-1)  # Parent
+    writer.write_int(0)  # Layer
+    writer.write_byte(30)  # Flags: Move | Rotate | Visible | Controllable
+    writer.write_byte(0)  # Flags 2
+    writer.write_vec3((0, 0, 0))  # Tail pos
+
+    # 2. Write Original Dummy Bones (Index 1 to N)
+    for b_idx in range(original_bones_count):
+        # +1 for 操作中心
+        b_name = f"Bone_{b_idx + 1}"
         writer.write_text(b_name)
         writer.write_text(b_name)
-        writer.write_vec3((0, 0, 0))  # Pos at origin
-        writer.write_bone_index(-1)  # No parent
+        writer.write_vec3((0, 0, 0))  # Pos
+        writer.write_bone_index(-1)  # Parent
         writer.write_int(0)  # Layer
         writer.write_byte(30)  # Flags: Move | Rotate | Visible | Controllable
         writer.write_byte(0)  # Flags 2
@@ -537,13 +556,10 @@ def main():
             writer.write_vec3(delta)
 
     # [Display Frames]
-    # Logic:
-    # 1. Root Frame: Contains Bone 0 (dummy root)
-    # 2. Facial Frame: Contains all Morphs
-    print("Writing Display Frames (Root & Facial)...")
-    writer.write_int(2)  # Count = 2 Frames
+    print("Writing Display Frames (Root, 表情, その他)...")
+    writer.write_int(3)  # Count = 3 Frames
 
-    # Frame 1: Root
+    # Frame 1: Root (Index 0: 操作中心)
     writer.write_text("Root")  # Name JP
     writer.write_text("Root")  # Name EN
     writer.write_byte(1)  # Special Frame
@@ -551,14 +567,27 @@ def main():
     writer.write_byte(0)  # Type: Bone
     writer.write_bone_index(0)  # Index: 0
 
-    # Frame 2: Facial (表情)
+    # Frame 2: 表情
     writer.write_text("表情")  # Name JP
-    writer.write_text("Facial")  # Name EN
+    writer.write_text("Morph")  # Name EN
     writer.write_byte(1)  # Special Frame
     writer.write_int(len(morph_list))  # Count = Number of morphs
     for m_idx in range(len(morph_list)):
         writer.write_byte(1)  # Type: Morph
         writer.write_morph_index(m_idx)  # Morph Index
+
+    # Frame 3: その他 (Contains all dummy bones)
+    # Indices from 1 to total_bones-1
+    writer.write_text("その他")
+    writer.write_text("Other")
+    writer.write_byte(0)  # Not a Special Frame
+
+    dummy_bone_count = original_bones_count
+    writer.write_int(dummy_bone_count)
+
+    for b_idx in range(1, total_bones):
+        writer.write_byte(0)  # Bone
+        writer.write_bone_index(b_idx)
 
     # [Rigid Bodies, Joints] (Empty)
     writer.write_int(0)
