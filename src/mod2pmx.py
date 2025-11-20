@@ -1,0 +1,527 @@
+# Copyright 2025 rintrint
+
+import math
+import os
+import re
+import struct
+import subprocess
+from pathlib import Path
+
+# ================= CONFIGURATION =================
+MOD_PATH = r"C:\Users\user\Desktop\여신 프롤로그 명조"
+OUTPUT_DIR = r"C:\Users\user\Desktop\pmx"
+OUTPUT_FILENAME = "mod2pmx.pmx"
+TEXCONV_PATH = r"C:\Users\user\Desktop\texconv.exe"
+MODEL_NAME = "mod2pmx_model"
+SCALE = 0.125
+# =================================================
+
+
+class BinaryWriter:
+    def __init__(self, path):
+        self.f = open(path, "wb")
+
+    def close(self):
+        self.f.close()
+
+    def write_bytes(self, data):
+        self.f.write(data)
+
+    def write_byte(self, v):
+        self.f.write(struct.pack("<B", v))  # Unsigned Byte
+
+    def write_signed_byte(self, v):
+        self.f.write(struct.pack("<b", v))  # Signed Byte
+
+    def write_int(self, v):
+        self.f.write(struct.pack("<i", v))
+
+    def write_float(self, v):
+        self.f.write(struct.pack("<f", v))
+
+    def write_vec3(self, v):
+        self.f.write(struct.pack("<3f", *v))
+
+    def write_vec2(self, v):
+        self.f.write(struct.pack("<2f", *v))
+
+    def write_vec4(self, v):
+        self.f.write(struct.pack("<4f", *v))
+
+    def write_text(self, text, encoding="utf-16-le"):
+        data = text.encode(encoding)
+        self.write_int(len(data))
+        self.f.write(data)
+
+    # PMX specific index writers (Fixed size for simplicity)
+    def write_vertex_index(self, idx):
+        self.write_int(idx)
+
+    def write_bone_index(self, idx):
+        self.f.write(struct.pack("<h", idx))
+
+    def write_material_index(self, idx):
+        self.write_signed_byte(idx)
+
+
+class IniAnalyzer:
+    def __init__(self, ini_path):
+        self.ini_path = ini_path
+        self.components = []
+        self.all_textures = set()
+
+    def parse(self):
+        print(f"Parsing INI file: {self.ini_path}")
+        current_section = ""
+        component_pattern = re.compile(r"\[TextureOverrideComponent(\d+)\]")
+        filename_pattern = re.compile(r"filename\s*=\s*(.*)")
+        draw_pattern = re.compile(r"drawindexed\s*=\s*(\d+),\s*(\d+),\s*(\d+)")
+
+        comp_data = {}
+
+        with open(self.ini_path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith(";"):
+                    continue
+
+                if line.startswith("["):
+                    current_section = line
+                    comp_match = component_pattern.match(line)
+                    if comp_match:
+                        c_id = int(comp_match.group(1))
+                        comp_data[c_id] = {"id": c_id, "indices": None}
+                    continue
+
+                if "TextureOverrideComponent" in current_section:
+                    draw_match = draw_pattern.match(line)
+                    if draw_match:
+                        count, start = int(draw_match.group(1)), int(draw_match.group(2))
+                        c_id = int(component_pattern.match(current_section).group(1))
+                        comp_data[c_id]["indices"] = (start, count)
+
+                # Collect all textures
+                file_match = filename_pattern.match(line)
+                if file_match:
+                    fname = file_match.group(1).replace('"', "").strip()
+                    if fname.lower().endswith(".dds"):
+                        self.all_textures.add(fname)
+
+        # Filter valid components and sort by start index
+        valid_comps = [c for c in comp_data.values() if c["indices"] is not None]
+        self.components = sorted(valid_comps, key=lambda x: x["indices"][0])
+        print(f"INI Parsed: Found {len(self.components)} components and {len(self.all_textures)} textures.")
+
+
+# --- Math & Transform Utils ---
+def normalize(v):
+    length = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    if length == 0:
+        return (0, 0, 0)
+    return (v[0] / length, v[1] / length, v[2] / length)
+
+
+def transform_pos(x, y, z):
+    # Blender (Z-up) to PMX (Y-up) with Scale
+    # Logic: -x, z, -y
+    return (-x * SCALE, z * SCALE, -y * SCALE)
+
+
+def transform_normal(x, y, z):
+    # Normal vector transformation
+    return (-x, z, -y)
+
+
+def transform_morph_delta(x, y, z):
+    # Morph offset transformation (same as pos)
+    return (-x * SCALE, z * SCALE, -y * SCALE)
+
+
+# --- Texture Utils ---
+def create_placeholder_png(path):
+    # 1x1 White Pixel PNG
+    png_data = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDAT\x08\xd7c\xf8\xff\xff?\x00\x05\xfe\x02\xfe\xdc\xccY\xe7\x00\x00\x00\x00IEND\xaeB`\x82"
+    with open(path, "wb") as f:
+        f.write(png_data)
+
+
+def convert_all_textures(mod_path, output_dir, texture_set):
+    print("Converting textures...")
+    tex_output_dir = Path(output_dir) / "tex"
+    tex_output_dir.mkdir(parents=True, exist_ok=True)
+
+    placeholder_path = tex_output_dir / "placeholder.png"
+    if not placeholder_path.exists():
+        create_placeholder_png(placeholder_path)
+
+    # Index 0 is always placeholder
+    converted_list = ["tex\\placeholder.png"]
+
+    if not os.path.exists(TEXCONV_PATH):
+        print("[Warning] texconv.exe not found. Skipping DDS conversion.")
+        return converted_list
+
+    for dds_rel_path in sorted(texture_set):
+        clean_dds_path = dds_rel_path.replace('"', "").replace("\\", "/").strip()
+        input_path = Path(mod_path) / clean_dds_path
+
+        if not input_path.exists():
+            continue
+
+        file_name = input_path.stem + ".png"
+        output_png_path = tex_output_dir / file_name
+
+        # Run texconv if PNG doesn't exist
+        if not output_png_path.exists():
+            print(f"Converting: {clean_dds_path}")
+            cmd = [TEXCONV_PATH, "-ft", "png", "-o", str(tex_output_dir), "-y", str(input_path)]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=60, check=True)
+            except Exception as e:
+                print(f"Conversion failed for {file_name}: {e}")
+
+        converted_list.append(f"tex\\{file_name}")
+
+    return converted_list
+
+
+# --- Data Reading Utils ---
+def read_blend_data(mesh_dir, vertex_count):
+    blend_path = mesh_dir / "Blend.buf"
+    blend_data = []
+    max_bone_index = 0
+
+    if blend_path.exists():
+        print("Reading Blend.buf (Weights)...")
+        with open(blend_path, "rb") as f:
+            data = f.read()
+            # Stride 8: 4 bytes indices, 4 bytes weights (0-255)
+            if len(data) // 8 != vertex_count:
+                print(f"[Warning] Blend.buf size mismatch. Expected {vertex_count} vertices.")
+
+            raw_bytes = struct.unpack(f"<{len(data)}B", data)
+
+            for i in range(0, len(raw_bytes), 8):
+                b_indices = (raw_bytes[i], raw_bytes[i + 1], raw_bytes[i + 2], raw_bytes[i + 3])
+                b_weights = (raw_bytes[i + 4] / 255.0, raw_bytes[i + 5] / 255.0, raw_bytes[i + 6] / 255.0, raw_bytes[i + 7] / 255.0)
+                blend_data.append((b_indices, b_weights))
+                max_bone_index = max(max_bone_index, max(b_indices))
+    else:
+        print("[Warning] Blend.buf not found. Using default weights.")
+        blend_data = [((0, 0, 0, 0), (1.0, 0.0, 0.0, 0.0))] * vertex_count
+
+    return blend_data, max_bone_index
+
+
+def read_color_data(mesh_dir, vertex_count):
+    color_path = mesh_dir / "Color.buf"
+    colors = []
+    if color_path.exists():
+        print("Reading Color.buf (Vertex Colors)...")
+        with open(color_path, "rb") as f:
+            data = f.read()
+            # RGBA, 1 byte per channel
+            if len(data) // 4 == vertex_count:
+                raw_bytes = struct.unpack(f"<{len(data)}B", data)
+                for i in range(0, len(raw_bytes), 4):
+                    r = raw_bytes[i] / 255.0
+                    g = raw_bytes[i + 1] / 255.0
+                    b = raw_bytes[i + 2] / 255.0
+                    a = raw_bytes[i + 3] / 255.0
+                    colors.append((r, g, b, a))
+            else:
+                print("[Warning] Color.buf size mismatch. Filling with white.")
+                colors = [(1.0, 1.0, 1.0, 1.0)] * vertex_count
+    else:
+        colors = [(1.0, 1.0, 1.0, 1.0)] * vertex_count
+    return colors
+
+
+def read_morph_data(mesh_dir):
+    offset_path = mesh_dir / "ShapeKeyOffset.buf"
+    id_path = mesh_dir / "ShapeKeyVertexId.buf"
+    val_path = mesh_dir / "ShapeKeyVertexOffset.buf"
+
+    if not (offset_path.exists() and id_path.exists() and val_path.exists()):
+        print("[Info] ShapeKey buffers not found. Skipping morphs.")
+        return []
+
+    print("Reading ShapeKey buffers...")
+    with open(offset_path, "rb") as f:
+        offsets = struct.unpack(f"<{os.path.getsize(offset_path) // 4}I", f.read())
+    with open(id_path, "rb") as f:
+        vertex_ids = struct.unpack(f"<{os.path.getsize(id_path) // 4}I", f.read())
+    with open(val_path, "rb") as f:
+        vertex_deltas = struct.unpack(f"<{os.path.getsize(val_path) // 2}e", f.read())
+
+    morphs = []
+    shape_key_count = 0
+
+    for i in range(len(offsets)):
+        start_idx = offsets[i]
+        if i == 0 or start_idx != offsets[i - 1]:
+            end_idx = offsets[i + 1] if i + 1 < len(offsets) else len(vertex_ids)
+            if end_idx <= start_idx:
+                continue
+            if start_idx == 0 and i > 0:
+                break
+
+            morph_name = f"ShapeKey_{shape_key_count}"
+            morph_data = []
+
+            for j in range(start_idx, end_idx):
+                if j >= len(vertex_ids):
+                    break
+                v_id = vertex_ids[j]
+
+                # Stride = 6 (PosDelta XYZ + NormalDelta XYZ)
+                # We skip Normal Delta (stride 6, take first 3)
+                d_idx = j * 6
+
+                if d_idx + 2 < len(vertex_deltas):
+                    dx = vertex_deltas[d_idx]
+                    dy = vertex_deltas[d_idx + 1]
+                    dz = vertex_deltas[d_idx + 2]
+
+                    # Only record if offset is significant
+                    if abs(dx) + abs(dy) + abs(dz) > 0.0001:
+                        trans_delta = transform_morph_delta(dx, dy, dz)
+                        morph_data.append((v_id, trans_delta))
+
+            if morph_data:
+                morphs.append({"name": morph_name, "offsets": morph_data})
+                shape_key_count += 1
+
+    print(f"Parsed {len(morphs)} ShapeKeys.")
+    return morphs
+
+
+# --- Main Logic ---
+def main():
+    print("\n=== Starting Final Mod to PMX Conversion ===")
+    mod_path = Path(MOD_PATH)
+    mesh_dir = mod_path / "Meshes"
+    output_path = Path(OUTPUT_DIR)
+    output_file = output_path / OUTPUT_FILENAME
+    ini_path = mod_path / "mod.ini"
+
+    # 1. Parse INI & Textures
+    analyzer = IniAnalyzer(ini_path)
+    analyzer.parse()
+    pmx_texture_list = convert_all_textures(MOD_PATH, OUTPUT_DIR, analyzer.all_textures)
+
+    # 2. Read Geometry
+    print("\nReading Geometry buffers...")
+    with open(mesh_dir / "Position.buf", "rb") as f:
+        count = os.path.getsize(mesh_dir / "Position.buf") // 12
+        raw_verts = struct.unpack(f"<{count * 3}f", f.read())
+
+    with open(mesh_dir / "Index.buf", "rb") as f:
+        indices = struct.unpack(f"<{os.path.getsize(mesh_dir / 'Index.buf') // 4}I", f.read())
+
+    normals = [(0, 1, 0)] * count
+    if (mesh_dir / "Vector.buf").exists():
+        with open(mesh_dir / "Vector.buf", "rb") as f:
+            raw_vecs = struct.unpack(f"<{os.path.getsize(mesh_dir / 'Vector.buf')}b", f.read())
+            normals = [(raw_vecs[i + 4] / 127.0, raw_vecs[i + 5] / 127.0, raw_vecs[i + 6] / 127.0) for i in range(0, len(raw_vecs), 8)]
+
+    uvs = [(0, 0)] * count
+    if (mesh_dir / "TexCoord.buf").exists():
+        with open(mesh_dir / "TexCoord.buf", "rb") as f:
+            raw_uvs = struct.unpack(f"<{os.path.getsize(mesh_dir / 'TexCoord.buf') // 2}e", f.read())
+            uvs = [(raw_uvs[i], raw_uvs[i + 1]) for i in range(0, len(raw_uvs), 8)]
+
+    blend_data, max_bone_idx = read_blend_data(mesh_dir, count)
+    colors = read_color_data(mesh_dir, count)
+    morph_list = read_morph_data(mesh_dir)
+
+    # 3. Write PMX
+    print(f"\nWriting PMX file: {output_file}")
+    writer = BinaryWriter(output_file)
+
+    # [Header]
+    writer.write_bytes(b"PMX ")
+    writer.write_float(2.0)
+    writer.write_byte(8)  # Globals
+    writer.write_byte(0)  # Encoding (UTF16LE)
+    writer.write_byte(2)  # Additional UVs (UV1=Empty, UV2=Color)
+    writer.write_byte(4)  # Vertex Index Size
+    writer.write_byte(1)  # Texture Index Size
+    writer.write_byte(1)  # Material Index Size
+    writer.write_byte(2)  # Bone Index Size
+    writer.write_byte(1)  # Morph Index Size
+    writer.write_byte(1)  # Rigid Index Size
+
+    # [Model Info]
+    writer.write_text(MODEL_NAME)
+    writer.write_text(MODEL_NAME)
+    writer.write_text("converted by mod2pmx")
+    writer.write_text("converted by mod2pmx")
+
+    # [Vertices]
+    print(f"Writing {count} vertices with dynamic BDEF optimization...")
+    writer.write_int(count)
+
+    for i in range(count):
+        # 1. Position
+        px, py, pz = transform_pos(raw_verts[i * 3], raw_verts[i * 3 + 1], raw_verts[i * 3 + 2])
+        writer.write_vec3((px, py, pz))
+
+        # 2. Normal
+        nx, ny, nz = normals[i]
+        writer.write_vec3(normalize(transform_normal(nx, ny, nz)))
+
+        # 3. UV
+        writer.write_vec2(uvs[i])
+
+        # 4. Additional UVs (x2)
+        writer.write_vec4((0.0, 0.0, 0.0, 0.0))  # AddUV1 (Empty)
+        writer.write_vec4(colors[i])  # AddUV2 (Vertex Color)
+
+        # 5. Weight Optimization (BDEF1 / BDEF2 / BDEF4)
+        raw_indices, raw_weights = blend_data[i]
+
+        # Filter valid bones (weight > 0)
+        valid_bones = [(raw_indices[j], raw_weights[j]) for j in range(4) if raw_weights[j] > 0.0001]
+
+        # Sort by weight descending
+        valid_bones.sort(key=lambda x: x[1], reverse=True)
+        b_count = len(valid_bones)
+
+        if b_count == 0:
+            # Fallback BDEF1
+            writer.write_byte(0)  # Type 0
+            writer.write_bone_index(0)
+
+        elif b_count == 1:
+            # BDEF1
+            writer.write_byte(0)  # Type 0
+            writer.write_bone_index(valid_bones[0][0])
+
+        elif b_count == 2:
+            # BDEF2
+            writer.write_byte(1)  # Type 1
+            b1, w1 = valid_bones[0]
+            b2, w2 = valid_bones[1]
+
+            # Normalize w1 (w2 is implicit in PMX)
+            w_total = w1 + w2
+            writer.write_bone_index(b1)
+            writer.write_bone_index(b2)
+            writer.write_float(w1 / w_total)
+
+        else:
+            # BDEF4 (Type 2) - Handle 3 or 4 bones
+            writer.write_byte(2)
+
+            # Prepare buffers
+            b_final = [0, 0, 0, 0]
+            w_final = [0.0, 0.0, 0.0, 0.0]
+
+            # Take top 4 (if > 4) or all available
+            limit = min(b_count, 4)
+            w_total = sum(item[1] for item in valid_bones[:limit])
+
+            for k in range(limit):
+                b_final[k] = valid_bones[k][0]
+                w_final[k] = valid_bones[k][1] / w_total  # Normalize
+
+            for b in b_final:
+                writer.write_bone_index(b)
+            for w in w_final:
+                writer.write_float(w)
+
+        # Edge Scale
+        writer.write_float(1.0)
+
+    # [Faces]
+    print(f"Writing {len(indices) // 3} faces...")
+    writer.write_int(len(indices))
+    for idx in indices:
+        writer.write_vertex_index(idx)
+
+    # [Textures]
+    print(f"Writing {len(pmx_texture_list)} textures...")
+    writer.write_int(len(pmx_texture_list))
+    for tex_path in pmx_texture_list:
+        writer.write_text(tex_path)
+
+    # [Materials]
+    print(f"Writing {len(analyzer.components)} materials...")
+    writer.write_int(len(analyzer.components))
+    for comp in analyzer.components:
+        c_id = comp["id"]
+        idx_cnt = comp["indices"][1]
+
+        writer.write_text(f"Component_{c_id}")  # JP Name
+        writer.write_text(f"Component_{c_id}")  # EN Name
+
+        # Diffuse, Specular, Shininess, Ambient
+        writer.write_vec4((1, 1, 1, 1))
+        writer.write_vec3((0, 0, 0))
+        writer.write_float(5)
+        writer.write_vec3((0.5, 0.5, 0.5))
+
+        # Flags: Double Sided (0x01)
+        writer.write_byte(1)
+
+        # Edge Color / Size
+        writer.write_vec4((0, 0, 0, 1))
+        writer.write_float(1.0)
+
+        # Texture Index (0 = placeholder)
+        writer.write_signed_byte(0)
+
+        # Sphere / Toon
+        writer.write_signed_byte(-1)
+        writer.write_byte(0)
+        writer.write_byte(0)
+        writer.write_signed_byte(-1)
+
+        writer.write_text("")  # Memo
+        writer.write_int(idx_cnt)  # Face Vertex Count
+
+    # [Bones]
+    # Dummy bones based on max index found in weights
+    total_bones = max_bone_idx + 1
+    print(f"Writing {total_bones} bones (Dummy structure)...")
+    writer.write_int(total_bones)
+
+    for b_idx in range(total_bones):
+        b_name = f"Bone_{b_idx}"
+        writer.write_text(b_name)
+        writer.write_text(b_name)
+        writer.write_vec3((0, 0, 0))  # Pos at origin
+        writer.write_bone_index(-1)  # No parent
+        writer.write_int(0)  # Layer
+        writer.write_byte(14)  # Flags: Move | Rotate | Visible
+        writer.write_byte(0)  # Flags 2
+        writer.write_vec3((0, 1, 0))  # Tail pos
+
+    # [Morphs]
+    print(f"Writing {len(morph_list)} morphs...")
+    writer.write_int(len(morph_list))
+    for morph in morph_list:
+        writer.write_text(morph["name"])
+        writer.write_text(morph["name"])
+        writer.write_byte(4)  # Category: Other
+        writer.write_byte(1)  # Type: Vertex
+
+        offsets = morph["offsets"]
+        writer.write_int(len(offsets))
+        for v_id, delta in offsets:
+            writer.write_vertex_index(v_id)
+            writer.write_vec3(delta)
+
+    # [Display Frames, Rigid Bodies, Joints] (Empty)
+    writer.write_int(0)
+    writer.write_int(0)
+    writer.write_int(0)
+
+    writer.close()
+    print(f"\n[Success] File generated: {OUTPUT_FILENAME}")
+    print("Conversion Complete!")
+
+
+if __name__ == "__main__":
+    main()
