@@ -5,14 +5,17 @@ import os
 import re
 import struct
 import subprocess
+import traceback
 from pathlib import Path
 
 # ================= CONFIGURATION =================
-MOD_PATH = r"C:\Users\user\Desktop\여신 프롤로그 명조"
-OUTPUT_DIR = r"C:\Users\user\Desktop\pmx"
-OUTPUT_FILENAME = "mod2pmx.pmx"
-TEXCONV_PATH = r"C:\Users\user\Desktop\texconv.exe"
-MODEL_NAME = "mod2pmx_model"
+# Base directories relative to the script location
+BASE_MOD_DIR = Path("mod")
+BASE_OUTPUT_DIR = Path("pmx")
+
+TEXCONV_PATH = Path("texconv.exe")
+
+# Global Scale setting
 SCALE = 0.125
 # =================================================
 
@@ -79,7 +82,7 @@ class IniAnalyzer:
         self.all_textures = set()
 
     def parse(self):
-        print(f"Parsing INI file: {self.ini_path}")
+        print(f"INI Parsing: {self.ini_path.name}")
         current_section = ""
         component_pattern = re.compile(r"\[TextureOverrideComponent(\d+)\]")
         filename_pattern = re.compile(r"filename\s*=\s*(.*)")
@@ -87,33 +90,36 @@ class IniAnalyzer:
 
         comp_data = {}
 
-        with open(self.ini_path, encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith(";"):
-                    continue
+        try:
+            with open(self.ini_path, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith(";"):
+                        continue
 
-                if line.startswith("["):
-                    current_section = line
-                    comp_match = component_pattern.match(line)
-                    if comp_match:
-                        c_id = int(comp_match.group(1))
-                        comp_data[c_id] = {"id": c_id, "indices": None}
-                    continue
+                    if line.startswith("["):
+                        current_section = line
+                        comp_match = component_pattern.match(line)
+                        if comp_match:
+                            c_id = int(comp_match.group(1))
+                            comp_data[c_id] = {"id": c_id, "indices": None}
+                        continue
 
-                if "TextureOverrideComponent" in current_section:
-                    draw_match = draw_pattern.match(line)
-                    if draw_match:
-                        count, start = int(draw_match.group(1)), int(draw_match.group(2))
-                        c_id = int(component_pattern.match(current_section).group(1))
-                        comp_data[c_id]["indices"] = (start, count)
+                    if "TextureOverrideComponent" in current_section:
+                        draw_match = draw_pattern.match(line)
+                        if draw_match:
+                            count, start = int(draw_match.group(1)), int(draw_match.group(2))
+                            c_id = int(component_pattern.match(current_section).group(1))
+                            comp_data[c_id]["indices"] = (start, count)
 
-                # Collect all textures
-                file_match = filename_pattern.match(line)
-                if file_match:
-                    fname = file_match.group(1).replace('"', "").strip()
-                    if fname.lower().endswith(".dds"):
-                        self.all_textures.add(fname)
+                    # Collect all textures
+                    file_match = filename_pattern.match(line)
+                    if file_match:
+                        fname = file_match.group(1).replace('"', "").strip()
+                        if fname.lower().endswith(".dds"):
+                            self.all_textures.add(fname)
+        except Exception as e:
+            print(f"[Error] Failed to read INI: {e}")
 
         # Filter valid components and sort by start index
         valid_comps = [c for c in comp_data.values() if c["indices"] is not None]
@@ -153,9 +159,9 @@ def create_placeholder_png(path):
         f.write(png_data)
 
 
-def convert_all_textures(mod_path, output_dir, texture_set):
+def convert_all_textures(mod_base_path, specific_output_dir, texture_set):
     print("Converting textures...")
-    tex_output_dir = Path(output_dir) / "tex"
+    tex_output_dir = Path(specific_output_dir) / "tex"
     tex_output_dir.mkdir(parents=True, exist_ok=True)
 
     placeholder_path = tex_output_dir / "placeholder.png"
@@ -165,16 +171,24 @@ def convert_all_textures(mod_path, output_dir, texture_set):
     # Index 0 is always placeholder
     converted_list = ["tex\\placeholder.png"]
 
-    if not os.path.exists(TEXCONV_PATH):
+    if not TEXCONV_PATH.exists():
         print("[Warning] texconv.exe not found. Skipping DDS conversion.")
+        # Still return the list assuming user might convert later
+        for dds_rel_path in sorted(texture_set):
+            file_name = Path(dds_rel_path).stem + ".png"
+            converted_list.append(f"tex\\{file_name}")
         return converted_list
 
     for dds_rel_path in sorted(texture_set):
         clean_dds_path = dds_rel_path.replace('"', "").replace("\\", "/").strip()
-        input_path = Path(mod_path) / clean_dds_path
+        input_path = Path(mod_base_path) / clean_dds_path
 
         if not input_path.exists():
-            continue
+            # Try to find it case-insensitive or in root
+            if (Path(mod_base_path) / Path(clean_dds_path).name).exists():
+                input_path = Path(mod_base_path) / Path(clean_dds_path).name
+            else:
+                continue
 
         file_name = input_path.stem + ".png"
         output_png_path = tex_output_dir / file_name
@@ -182,11 +196,11 @@ def convert_all_textures(mod_path, output_dir, texture_set):
         # Run texconv if PNG doesn't exist
         if not output_png_path.exists():
             print(f"Converting: {clean_dds_path}")
-            cmd = [TEXCONV_PATH, "-ft", "png", "-o", str(tex_output_dir), "-y", str(input_path)]
+            cmd = [str(TEXCONV_PATH), "-ft", "png", "-o", str(tex_output_dir), "-y", str(input_path)]
             try:
                 subprocess.run(cmd, capture_output=True, timeout=60, check=True)
             except Exception as e:
-                print(f"Conversion failed for {file_name}: {e}")
+                print(f"[Error] Conversion failed for {file_name}: {e}")
 
         converted_list.append(f"tex\\{file_name}")
 
@@ -304,39 +318,60 @@ def read_morph_data(mesh_dir):
     return morphs
 
 
-# --- Main Logic ---
-def main():
-    print("\n=== Starting Final Mod to PMX Conversion ===")
-    mod_path = Path(MOD_PATH)
-    mesh_dir = mod_path / "Meshes"
-    output_path = Path(OUTPUT_DIR)
-    output_file = output_path / OUTPUT_FILENAME
-    ini_path = mod_path / "mod.ini"
+# --- Core Logic for Single Mod ---
+def process_single_mod(ini_path, output_dir):
+    """Process a single .ini file and generates a .pmx file in the output directory."""
+    mod_base_path = ini_path.parent
+    mesh_dir = mod_base_path / "Meshes"
+
+    # Determine output filename based on ini filename (e.g. mod.ini -> mod.pmx)
+    pmx_filename = ini_path.stem + ".pmx"
+    output_file = output_dir / pmx_filename
+
+    # Determine Model Name from Folder Name
+    model_name_internal = mod_base_path.name
+
+    print(f"\n>>> Processing: {ini_path}")
+    print(f"Target: {output_file}")
+
+    if not mesh_dir.exists():
+        print(f"[Skip] 'Meshes' folder not found in {mod_base_path}")
+        return
 
     # 1. Parse INI & Textures
     analyzer = IniAnalyzer(ini_path)
     analyzer.parse()
-    pmx_texture_list = convert_all_textures(MOD_PATH, OUTPUT_DIR, analyzer.all_textures)
+
+    # Pass output_dir so textures go to pmx/SubFolder/tex
+    pmx_texture_list = convert_all_textures(mod_base_path, output_dir, analyzer.all_textures)
 
     # 2. Read Geometry
     print("\nReading Geometry buffers...")
-    with open(mesh_dir / "Position.buf", "rb") as f:
-        count = os.path.getsize(mesh_dir / "Position.buf") // 12
+    pos_path = mesh_dir / "Position.buf"
+    if not pos_path.exists():
+        print(f"[Error] Position.buf missing in {mesh_dir}")
+        return
+
+    with open(pos_path, "rb") as f:
+        count = os.path.getsize(pos_path) // 12
         raw_verts = struct.unpack(f"<{count * 3}f", f.read())
 
-    with open(mesh_dir / "Index.buf", "rb") as f:
-        indices = struct.unpack(f"<{os.path.getsize(mesh_dir / 'Index.buf') // 4}I", f.read())
+    idx_path = mesh_dir / "Index.buf"
+    with open(idx_path, "rb") as f:
+        indices = struct.unpack(f"<{os.path.getsize(idx_path) // 4}I", f.read())
 
     normals = [(0, 1, 0)] * count
-    if (mesh_dir / "Vector.buf").exists():
-        with open(mesh_dir / "Vector.buf", "rb") as f:
-            raw_vecs = struct.unpack(f"<{os.path.getsize(mesh_dir / 'Vector.buf')}b", f.read())
+    vec_path = mesh_dir / "Vector.buf"
+    if vec_path.exists():
+        with open(vec_path, "rb") as f:
+            raw_vecs = struct.unpack(f"<{os.path.getsize(vec_path)}b", f.read())
             normals = [(raw_vecs[i + 4] / 127.0, raw_vecs[i + 5] / 127.0, raw_vecs[i + 6] / 127.0) for i in range(0, len(raw_vecs), 8)]
 
     uvs = [(0, 0)] * count
-    if (mesh_dir / "TexCoord.buf").exists():
-        with open(mesh_dir / "TexCoord.buf", "rb") as f:
-            raw_uvs = struct.unpack(f"<{os.path.getsize(mesh_dir / 'TexCoord.buf') // 2}e", f.read())
+    uv_path = mesh_dir / "TexCoord.buf"
+    if uv_path.exists():
+        with open(uv_path, "rb") as f:
+            raw_uvs = struct.unpack(f"<{os.path.getsize(uv_path) // 2}e", f.read())
             uvs = [(raw_uvs[i], raw_uvs[i + 1]) for i in range(0, len(raw_uvs), 8)]
 
     blend_data, max_bone_idx = read_blend_data(mesh_dir, count)
@@ -345,6 +380,7 @@ def main():
 
     # 3. Write PMX
     print(f"\nWriting PMX file: {output_file}")
+    output_dir.mkdir(parents=True, exist_ok=True)
     writer = BinaryWriter(output_file)
 
     # [Header]
@@ -362,13 +398,13 @@ def main():
     writer.write_byte(1)  # Rigid Index Size
 
     # [Model Info]
-    writer.write_text(MODEL_NAME)
-    writer.write_text(MODEL_NAME)
+    writer.write_text(model_name_internal)
+    writer.write_text(model_name_internal)
     writer.write_text("converted by mod2pmx")
     writer.write_text("converted by mod2pmx")
 
     # [Vertices]
-    print(f"Writing {count} vertices with dynamic BDEF optimization...")
+    print(f"Writing {count} vertices...")
     writer.write_int(count)
 
     for i in range(count):
@@ -594,8 +630,48 @@ def main():
     writer.write_int(0)
 
     writer.close()
-    print(f"\n[Success] File generated: {OUTPUT_FILENAME}")
-    print("Conversion Complete!")
+    print(f"[Success] Created: {pmx_filename}")
+
+
+def main():
+    print("\n=== Batch Mod to PMX Converter ===")
+
+    if not BASE_MOD_DIR.exists():
+        print(f"[Error] '{BASE_MOD_DIR}' folder not found. Please create it and put mods inside.")
+        return
+
+    # Recursively find all .ini files
+    ini_files = list(BASE_MOD_DIR.rglob("*.ini"))
+
+    if not ini_files:
+        print(f"[Info] No .ini files found in '{BASE_MOD_DIR}'.")
+        return
+
+    print(f"Found {len(ini_files)} mod configs. Starting batch process...")
+
+    for ini_path in ini_files:
+        # Skip if inside a 'Disabled' folder (optional common pattern) or system files
+        if "desktop.ini" in ini_path.name.lower():
+            continue
+
+        # Calculate relative path structure
+        # e.g. mod/CharA/SkinB/mod.ini -> CharA/SkinB
+        try:
+            relative_parent = ini_path.parent.relative_to(BASE_MOD_DIR)
+        except ValueError:
+            # Should not happen given rglob logic
+            continue
+
+        # Mirror structure in output
+        target_output_dir = BASE_OUTPUT_DIR / relative_parent
+
+        try:
+            process_single_mod(ini_path, target_output_dir)
+        except Exception:
+            print(f"[Error] Failed processing {ini_path.name}:")
+            traceback.print_exc()
+
+    print("\n=== Batch Conversion Complete ===")
 
 
 if __name__ == "__main__":
