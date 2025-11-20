@@ -33,6 +33,9 @@ class BinaryWriter:
     def write_signed_byte(self, v):
         self.f.write(struct.pack("<b", v))  # Signed Byte
 
+    def write_short(self, v):
+        self.f.write(struct.pack("<h", v))  # Signed Short (2 bytes)
+
     def write_int(self, v):
         self.f.write(struct.pack("<i", v))
 
@@ -53,15 +56,20 @@ class BinaryWriter:
         self.write_int(len(data))
         self.f.write(data)
 
-    # PMX specific index writers (Fixed size for simplicity)
+    # PMX specific index writers
+    # NOTE: Sizes must match the Header definitions in main()
+    # Use larger index values here. This may slightly increase file size vs PMXEditor/MMD Tools
     def write_vertex_index(self, idx):
-        self.write_int(idx)
+        self.write_int(idx)  # 4 bytes
 
     def write_bone_index(self, idx):
-        self.f.write(struct.pack("<h", idx))
+        self.write_short(idx)  # 2 bytes
+
+    def write_morph_index(self, idx):
+        self.write_short(idx)  # 2 bytes (Updated to match Header)
 
     def write_material_index(self, idx):
-        self.write_signed_byte(idx)
+        self.write_signed_byte(idx)  # 1 byte
 
 
 class IniAnalyzer:
@@ -349,7 +357,9 @@ def main():
     writer.write_byte(1)  # Texture Index Size
     writer.write_byte(1)  # Material Index Size
     writer.write_byte(2)  # Bone Index Size
-    writer.write_byte(1)  # Morph Index Size
+
+    # [UPDATE] Set Morph Index Size to 2 (Short) to handle > 255 morphs
+    writer.write_byte(2)  # Morph Index Size
     writer.write_byte(1)  # Rigid Index Size
 
     # [Model Info]
@@ -459,15 +469,28 @@ def main():
         # Diffuse, Specular, Shininess, Ambient
         writer.write_vec4((1, 1, 1, 1))
         writer.write_vec3((0, 0, 0))
-        writer.write_float(5)
+        writer.write_float(50)
         writer.write_vec3((0.5, 0.5, 0.5))
 
-        # Flags: Double Sided (0x01)
-        writer.write_byte(1)
+        # Material Flags
+        is_double_sided = True
+        enabled_drop_shadow = True
+        enabled_self_shadow_map = True
+        enabled_self_shadow = True
+        enabled_toon_edge = True
+
+        flags = 0
+        flags |= int(is_double_sided)
+        flags |= int(enabled_drop_shadow) << 1
+        flags |= int(enabled_self_shadow_map) << 2
+        flags |= int(enabled_self_shadow) << 3
+        flags |= int(enabled_toon_edge) << 4
+
+        writer.write_byte(flags)
 
         # Edge Color / Size
         writer.write_vec4((0, 0, 0, 1))
-        writer.write_float(1.0)
+        writer.write_float(0.5)
 
         # Texture Index (0 = placeholder)
         writer.write_signed_byte(0)
@@ -494,7 +517,7 @@ def main():
         writer.write_vec3((0, 0, 0))  # Pos at origin
         writer.write_bone_index(-1)  # No parent
         writer.write_int(0)  # Layer
-        writer.write_byte(14)  # Flags: Move | Rotate | Visible
+        writer.write_byte(30)  # Flags: Move | Rotate | Visible | Controllable
         writer.write_byte(0)  # Flags 2
         writer.write_vec3((0, 1, 0))  # Tail pos
 
@@ -513,8 +536,31 @@ def main():
             writer.write_vertex_index(v_id)
             writer.write_vec3(delta)
 
-    # [Display Frames, Rigid Bodies, Joints] (Empty)
-    writer.write_int(0)
+    # [Display Frames]
+    # Logic:
+    # 1. Root Frame: Contains Bone 0 (dummy root)
+    # 2. Facial Frame: Contains all Morphs
+    print("Writing Display Frames (Root & Facial)...")
+    writer.write_int(2)  # Count = 2 Frames
+
+    # Frame 1: Root
+    writer.write_text("Root")  # Name JP
+    writer.write_text("Root")  # Name EN
+    writer.write_byte(1)  # Special Frame
+    writer.write_int(1)  # 1 Element
+    writer.write_byte(0)  # Type: Bone
+    writer.write_bone_index(0)  # Index: 0
+
+    # Frame 2: Facial (表情)
+    writer.write_text("表情")  # Name JP
+    writer.write_text("Facial")  # Name EN
+    writer.write_byte(1)  # Special Frame
+    writer.write_int(len(morph_list))  # Count = Number of morphs
+    for m_idx in range(len(morph_list)):
+        writer.write_byte(1)  # Type: Morph
+        writer.write_morph_index(m_idx)  # Morph Index
+
+    # [Rigid Bodies, Joints] (Empty)
     writer.write_int(0)
     writer.write_int(0)
 
